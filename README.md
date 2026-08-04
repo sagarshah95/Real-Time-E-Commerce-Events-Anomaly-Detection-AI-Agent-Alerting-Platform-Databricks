@@ -760,9 +760,24 @@ docker exec -it spark-master /opt/spark/bin/spark-submit --master spark://spark-
 
 ## B) Databricks Lakehouse
 
-**Prerequisites:** a Unity Catalog workspace (Free Edition works), an OpenAI API key, and a Discord webhook URL.
+This is a complete, detailed walkthrough assuming you are starting with nothing set up.
 
-**1. Create catalog, schema, and volume:**
+### Prerequisites (gather these first)
+
+1. **A Databricks workspace** — [Databricks Free Edition](https://www.databricks.com/learn/free-edition) is sufficient (it includes serverless compute and Unity Catalog).
+2. **An OpenAI API key** — from https://platform.openai.com/api-keys. Confirm your key can access the model the notebook calls (`gpt-5-mini`); if not, you'll swap the model name in Step 8.
+3. **A Discord webhook URL** — In your Discord server: **Server Settings → Integrations → Webhooks → New Webhook → Copy Webhook URL**.
+4. **(Optional) The Databricks CLI** on your machine for creating secrets — [install docs](https://docs.databricks.com/en/dev-tools/cli/install.html). You can also create secrets from a notebook (shown in Step 4).
+
+### Step 1 — Sign in and start compute
+
+1. Log into your Databricks workspace.
+2. In the left sidebar, confirm **Catalog** is visible (means Unity Catalog is enabled — default on Free Edition).
+3. Compute is **serverless** on Free Edition, so you don't need to create a cluster; notebooks attach to serverless automatically.
+
+### Step 2 — Create the catalog, schema, and volume
+
+Open a new notebook (**+ New → Notebook**), set the language to **SQL** (or use `%sql`), attach it to serverless, and run:
 
 ```sql
 CREATE CATALOG IF NOT EXISTS `real-time-streaming-lakehouse`;
@@ -770,9 +785,33 @@ CREATE SCHEMA  IF NOT EXISTS `real-time-streaming-lakehouse`.`ecommerce-events`;
 CREATE VOLUME  IF NOT EXISTS `real-time-streaming-lakehouse`.`ecommerce-events`.`ecommerce-events`;
 ```
 
-**2. Create the alert-history table** — run `databricks_version/sql/create_table.sql` with the placeholders substituted (see above).
+Why these exact names: every notebook has these hard-coded as widget defaults, and the volume path `/Volumes/real-time-streaming-lakehouse/ecommerce-events` maps to a volume literally named `ecommerce-events` inside that schema.
 
-**3. Create the secret scope:**
+> If your account blocks `CREATE CATALOG`, create it via the UI instead: **Catalog → Create Catalog**, name it `real-time-streaming-lakehouse`, then run only the `CREATE SCHEMA` and `CREATE VOLUME` lines.
+
+**Verify:** In the sidebar → **Catalog**, expand `real-time-streaming-lakehouse` → `ecommerce-events` and confirm the `ecommerce-events` volume appears under **Volumes**.
+
+### Step 3 — Create the alert-history table
+
+In the same SQL notebook, run (this is `databricks_version/sql/create_table.sql` with placeholders filled in):
+
+```sql
+CREATE TABLE IF NOT EXISTS `real-time-streaming-lakehouse`.`ecommerce-events`.`alert-history` (
+    window_start  TIMESTAMP,
+    window_end    TIMESTAMP,
+    alert_send_at TIMESTAMP,
+    alert_reasons array<string>,
+    alert_text    string
+);
+```
+
+This table is what notebook 05 uses to avoid sending duplicate alerts.
+
+### Step 4 — Store the OpenAI + Discord secrets
+
+Notebook 05 reads from a secret scope named **exactly** `anomaly_proj_secrets`.
+
+**Option A — Databricks CLI (recommended):**
 
 ```bash
 databricks secrets create-scope anomaly_proj_secrets
@@ -780,20 +819,125 @@ databricks secrets put-secret anomaly_proj_secrets openai_api_key
 databricks secrets put-secret anomaly_proj_secrets discord_webhook_url
 ```
 
-**4. Import the notebooks** into the exact folder `/Workspace/Real Time Streaming Lakehouse with Intelligent Alerting/`, keeping names `01_…`–`05_…`.
+Each `put-secret` opens an editor where you paste the value.
 
-**5. Fix the two bugs in `05_anomalies_detection`** (see the notebook 05 walkthrough above).
+**Option B — from a notebook** using the SDK:
 
-**6. Run notebooks 01 → 05 in order** on serverless compute (each uses `trigger(availableNow=True)`, so it processes available data and stops). Verify with:
+```python
+%pip install databricks-sdk --upgrade
+dbutils.library.restartPython()
+
+from databricks.sdk import WorkspaceClient
+w = WorkspaceClient()
+w.secrets.create_scope(scope="anomaly_proj_secrets")
+w.secrets.put_secret(scope="anomaly_proj_secrets", key="openai_api_key",      string_value="sk-...")
+w.secrets.put_secret(scope="anomaly_proj_secrets", key="discord_webhook_url", string_value="https://discord.com/api/webhooks/...")
+```
+
+**Verify:** `dbutils.secrets.list("anomaly_proj_secrets")` should list both keys (values are redacted).
+
+### Step 5 — Import the notebooks into the exact folder
+
+The Job task paths are hard-coded, so the folder name must match exactly.
+
+1. In the sidebar, go to **Workspace**.
+2. Create a folder named exactly: `Real Time Streaming Lakehouse with Intelligent Alerting`
+3. Open that folder → **⋮ (kebab) → Import** → drag in all five `.ipynb` files from `databricks_version/notebooks/`.
+4. Confirm the names are `01_generate_raw_data`, `02_bronze_ingest`, `03_silver_clean_data`, `04_gold_aggregate`, `05_anomalies_detection` (no extra suffixes).
+
+### Step 6 — Fix the two bugs in `05_anomalies_detection`
+
+Open notebook 05 and fix the Discord cell before running. Replace it with:
+
+```python
+discord_payload = {
+    'content': f"""
+    **Anomaly Incident Alert**
+    **Window:** {current["window_start"]} to {current["window_end"]}
+    **Rules Triggered:**
+    {chr(10).join([f"-{a}" for a in anomalies])}
+    **AI Analyst Summary:**
+    {alert_text}
+    """
+}
+if anomalies:
+    result = requests.post(DISCORD_URL, json=discord_payload)   # was DISCORD_WEBHOOK_URL (undefined)
+    if result.status_code not in [200, 204]:                    # moved inside the if-block
+        raise Exception(f"Discord alert failed: {result.status_code}, {result.text}")
+    print("Discord alert sent")
+```
+
+The two fixes: `DISCORD_WEBHOOK_URL` → `DISCORD_URL` (matches the secret loaded at the top of the notebook), and the status-code check is moved inside `if anomalies:` so `result` is always defined when referenced.
+
+### Step 7 — Run notebook 01 (generate data)
+
+1. Open `01_generate_raw_data`, attach to serverless.
+2. Check the `volume_path` widget at the top reads `/Volumes/real-time-streaming-lakehouse/ecommerce-events` (default).
+3. **Run All.** It writes 10 JSON files (~300 events) into `{volume}/raw_events/`.
+
+**Verify:** In Catalog → the volume → `raw_events`, you should see `events_*.json` files.
+
+### Step 8 — Run notebooks 02 → 04 (the pipeline)
+
+Run each **top to bottom**, in order. Each uses `trigger(availableNow=True)`, meaning it processes all available data and then stops (no long-running stream to babysit).
+
+| Notebook | Reads | Writes | What it does |
+|---|---|---|---|
+| `02_bronze_ingest` | `raw_events/*.json` | `bronze-events` | Auto Loader ingests raw JSON, adds `ingested_at` + `source` lineage |
+| `03_silver_clean_data` | `bronze-events` | `silver-events` | Null-filter, cast timestamp, 10-min watermark, dedup, `processed_at` |
+| `04_gold_aggregate` | `silver-events` | `gold-kpi-metrics` | 5-min tumbling windows → KPIs (revenue, conversion, AOV, etc.) |
+
+If your OpenAI plan doesn't have `gpt-5-mini`, open notebook 05 (cell 16) and change the model string to one you have (e.g. `gpt-4o-mini`).
+
+**Verify after 04:**
 
 ```sql
-SELECT * FROM `real-time-streaming-lakehouse`.`ecommerce-events`.`gold-kpi-metrics` ORDER BY window_start DESC;
+SELECT * FROM `real-time-streaming-lakehouse`.`ecommerce-events`.`gold-kpi-metrics`
+ORDER BY window_start DESC;
+```
+
+You should see one row per 5-minute window with `total_events`, `unique_users`, `total_revenue`, `purchase_count`, `conversion_rate`, `avg_order_value`.
+
+### Step 9 — Run notebook 05 (anomaly detection + alerting)
+
+**Run All.** It will:
+
+- Pick the newest Gold window not already in `alert-history` (left-anti join).
+- Compare it to the previous window against the four rules.
+- If **no anomaly**: it writes a "No anomaly detected" row and exits — this is the normal case with default data.
+- If **an anomaly fires**: it pulls funnel/category/page context from Silver, calls OpenAI for a summary, posts to Discord, and appends to `alert-history`.
+
+**Verify:**
+
+```sql
 SELECT * FROM `real-time-streaming-lakehouse`.`ecommerce-events`.`alert-history`;
 ```
 
-**7. (Optional) Orchestrate** via `databricks_version/workflow/databricks_pipeline.py` (SDK) or build the same DAG by hand in the Workflows UI.
+**Forcing an alert (for a real end-to-end demo):** the random data usually looks healthy (conversion ~20–27%), so nothing posts to Discord. To trigger the pipeline, edit notebook 01's `generate_event()` to skew one window — e.g. make the newest batch emit almost no `purchase` events or far fewer unique users than the prior window — then re-run 01 → 05. You should then see a Discord message and a populated `alert-history` row.
 
-> The default synthetic data usually looks "healthy", so no anomaly fires. To force an alert, edit notebook 01 to emit a window with very few purchases or unique users relative to the previous window.
+### Step 10 — (Optional) Orchestrate as a Job
+
+Instead of running notebooks by hand, wire them into a Databricks Job. Two ways:
+
+**Via the SDK** (`databricks_version/workflow/databricks_pipeline.py`):
+
+- `pip install databricks-sdk`, configure `DATABRICKS_HOST` / `DATABRICKS_TOKEN`.
+- For a brand-new job, use `w.jobs.create(**Real_Time_Streaming_Events_Pipeline.as_shallow_dict())` (the file's `w.jobs.reset(..., job_id=1234)` only updates an existing job `1234`).
+- Note: the `Raw_Data_Generation` task ships as `"disabled": True` — enable it if you want the Job to generate data too.
+
+**Via the UI (simpler):** **Workflows → Create Job**, add five notebook tasks pointing at `01`–`05` in the folder from Step 5, chaining each with a "depends on" the previous. Run the job.
+
+### Quick sequence recap
+
+```text
+1. Free Edition workspace            6. Fix 2 bugs in notebook 05
+2. CREATE catalog/schema/volume      7. Run 01 (generate data)
+3. CREATE alert-history table        8. Run 02 → 03 → 04 (pipeline)
+4. Create secret scope + 2 keys      9. Run 05 (detect + alert)
+5. Import notebooks to exact folder  10. (Optional) Wrap in a Job
+```
+
+The most common first-run failures are: wrong folder/catalog/volume names (must match exactly), the notebook 05 Discord bug, and an OpenAI model your key can't access.
 
 ---
 
