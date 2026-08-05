@@ -951,7 +951,7 @@ The most common first-run failures are: wrong folder/catalog/volume names (must 
 
 ---
 
-# Databricks & Data Engineering Concepts (Interview Guide)
+# Databricks & Data Engineering Concepts 
 
 This section maps every Databricks concept used in this project to **where it appears in the code** and **how to talk about it in an interview**. Each entry has: what it is → how this project uses it → likely interview questions and talking points.
 
