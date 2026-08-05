@@ -949,6 +949,270 @@ The most common first-run failures are: wrong folder/catalog/volume names (must 
 * **Observability:** KPI monitoring, alert-history dedup, incident reporting.
 * **AI Integration:** OpenAI-powered, context-aware incident analysis and automated Discord notifications.
 
+---
+
+# Databricks & Data Engineering Concepts (Interview Guide)
+
+This section maps every Databricks concept used in this project to **where it appears in the code** and **how to talk about it in an interview**. Each entry has: what it is → how this project uses it → likely interview questions and talking points.
+
+## 1. Lakehouse & the Medallion Architecture
+
+**What it is:** A design pattern that layers data into **Bronze (raw)** → **Silver (cleaned/conformed)** → **Gold (business aggregates)**. The "lakehouse" combines the low-cost, open storage of a data lake with the ACID reliability and performance of a warehouse.
+
+**In this project:** Notebooks `02/03/04` implement the three layers as Delta tables `bronze-events`, `silver-events`, `gold-kpi-metrics`.
+
+**Interview talking points:**
+- Bronze preserves raw data for **replayability and auditability** — you can always rebuild Silver/Gold if logic changes.
+- Silver is where **data quality** lives (validation, dedup, typing).
+- Gold is **consumption-ready** — small, aggregated, and fast to query for dashboards/alerts.
+- *Q: Why not just transform once?* A: Separation of concerns, reprocessing safety, and each layer serves different consumers.
+
+## 2. Unity Catalog (three-level namespace & governance)
+
+**What it is:** Databricks' centralized governance layer. Objects are addressed as **`catalog.schema.table`** (e.g. `` `real-time-streaming-lakehouse`.`ecommerce-events`.`gold-kpi-metrics` ``), with centralized access control, lineage, and auditing.
+
+**In this project:** Every notebook parameterizes `catalog` and `schema` and builds fully-qualified names. Tables are created with `CREATE CATALOG / SCHEMA` and written via `.toTable(...)` / `.saveAsTable(...)`.
+
+**Interview talking points:**
+- The **three-level namespace** (`catalog.schema.table`) vs. the legacy two-level Hive metastore (`schema.table`).
+- Unity Catalog governs **tables, volumes, models, and functions** in one place, with lineage across them.
+- Note the backtick-quoting here is required because the catalog/schema names contain hyphens.
+
+## 3. Volumes (governed non-tabular storage)
+
+**What it is:** A Unity Catalog object for storing **files** (non-tabular data) at a path like `/Volumes/<catalog>/<schema>/<volume>/...`. It's the governed replacement for raw DBFS mounts.
+
+**In this project:** `01_generate_raw_data` writes JSON files to `/Volumes/real-time-streaming-lakehouse/ecommerce-events/raw_events/`, and checkpoints/schema locations also live under the Volume.
+
+**Interview talking points:**
+- Volumes are for **files** (JSON, CSV, images, checkpoints); tables are for **structured/tabular** data.
+- Why Volumes over DBFS mounts: **governance, access control, and lineage** through Unity Catalog.
+
+## 4. Delta Lake (ACID storage format)
+
+**What it is:** An open table format over Parquet that adds ACID transactions, schema enforcement/evolution, time travel, and a transaction log.
+
+**In this project:** Every layer is written with `.format("delta")`. The Kafka/local jobs also enable Delta via `spark.sql.extensions = io.delta.sql.DeltaSparkSessionExtension`.
+
+**Interview talking points:**
+- **ACID on a data lake** — concurrent reads/writes are safe via the Delta transaction log (`_delta_log`).
+- **Time travel** (`VERSION AS OF` / `TIMESTAMP AS OF`) for audits and rollback.
+- **Schema enforcement** rejects bad writes; **schema evolution** allows controlled changes.
+- Enables **exactly-once streaming** sinks when combined with checkpoints.
+
+## 5. Auto Loader (`cloudFiles`) — incremental file ingestion
+
+**What it is:** Databricks' scalable, incremental file-ingestion source. It tracks which files it has already processed so each run only picks up **new** files.
+
+**In this project (`02_bronze_ingest`):**
+```python
+spark.readStream.format("cloudFiles")
+    .option("cloudFiles.format", "json")
+    .option("cloudFiles.inferColumnTypes", "true")
+    .option("cloudFiles.schemaLocation", SCHEMA_LOCATION)
+    .option("cloudFiles.schemaEvolutionMode", "rescue")
+    .load(RAW_FILE)
+```
+
+**Interview talking points:**
+- Auto Loader vs. `spark.readStream.format("json")`: Auto Loader **remembers processed files** (via checkpoint) and scales to millions of files; it can use file notifications or directory listing.
+- **`schemaLocation`** persists the inferred schema; **`schemaEvolutionMode="rescue"`** routes unexpected/mismatched fields into a `_rescued_data` column instead of failing the stream.
+- Adding `_metadata.file_path` gives **data lineage** (which file each row came from).
+
+## 6. Structured Streaming (unified batch + stream)
+
+**What it is:** Spark's streaming engine where a stream is treated as an unbounded table; the same DataFrame API works for batch and streaming.
+
+**In this project:** `readStream.table(...)` / `writeStream...toTable(...)` chain Bronze→Silver→Gold as streams.
+
+**Interview talking points:**
+- **Micro-batch** model by default; incremental processing of new data.
+- The **same code** can run as batch or streaming — a core Spark selling point.
+
+## 7. Trigger modes — `availableNow` vs `processingTime`
+
+**What it is:** Controls *when* a streaming query fires a micro-batch.
+
+**In this project:**
+- Databricks notebooks use `trigger(availableNow=True)` — process **all currently available data, then stop**. This makes each notebook behave like an incremental batch job, perfect for a scheduled Job.
+- The local Spark jobs use `trigger(processingTime="10/30/60 seconds")` — a **continuously running** stream that fires on a fixed interval.
+
+**Interview talking points:**
+- **`availableNow`** = "catch up and stop" → cost-efficient, ideal for orchestrated/scheduled runs (you don't pay for an always-on cluster).
+- **`processingTime`** = always-on, low-latency near-real-time.
+- This project deliberately shows **both** styles across the two implementations.
+
+## 8. Checkpointing & exactly-once
+
+**What it is:** A checkpoint directory persists stream **offsets and state** so a query can restart without data loss or duplication.
+
+**In this project:** Every `writeStream` sets `.option("checkpointLocation", ...)` (e.g. `{volume}/checkpoints/bronze`).
+
+**Interview talking points:**
+- Checkpoints + Delta sink → **exactly-once** end-to-end.
+- Deleting a checkpoint reprocesses from scratch; **never share one checkpoint between two queries**.
+
+## 9. Watermarking & late-data handling
+
+**What it is:** `withWatermark(col, threshold)` tells Spark how long to wait for late events, which bounds how much **state** stateful operators must retain.
+
+**In this project:** Silver uses a 10-minute watermark before dedup; Gold uses a 10-minute watermark before windowed aggregation.
+```python
+.withWatermark("event_timestamp", "10 minutes")
+```
+
+**Interview talking points:**
+- Distinguish **event time** (when it happened) vs **processing time** (when Spark saw it). Watermarks operate on event time.
+- Without a watermark, stateful operators (dedup, aggregation, joins) would grow state **unbounded**.
+- Trade-off: longer watermark = more late data captured but more state/memory.
+
+## 10. Windowed aggregations (tumbling windows)
+
+**What it is:** Grouping events into fixed time buckets. `F.window("event_timestamp", "5 minutes")` creates non-overlapping (tumbling) 5-minute windows.
+
+**In this project (`04_gold_aggregate`):** computes `total_events`, `unique_users`, `total_revenue`, `purchase_count`, `conversion_rate`, `avg_order_value` per 5-minute window.
+
+**Interview talking points:**
+- **Tumbling** (fixed, non-overlapping) vs **sliding** (overlapping) vs **session** windows.
+- Combined with watermarking, windows finalize once the watermark passes the window end.
+
+## 11. Stateful deduplication
+
+**What it is:** `dropDuplicates([...])` on a stream keeps state to detect repeat keys; pairing it with a watermark bounds that state.
+
+**In this project (`03_silver_clean_data`):**
+```python
+.dropDuplicates(["user_id", "event_type", "event_timestamp", "product_id"])
+```
+
+**Interview talking points:**
+- Idempotency: protects against **duplicate delivery** (e.g. at-least-once sources like Kafka).
+- Why the watermark matters here: it lets Spark **drop old keys** from the dedup state store.
+
+## 12. Output modes — `append` vs `complete`
+
+**What it is:** Defines what gets written each trigger.
+
+**In this project:** Bronze/Silver use `append` (new rows only). Gold uses `complete` (rewrite the full aggregate result each trigger).
+
+**Interview talking points:**
+- **Append** — for non-aggregated or windowed-with-watermark data.
+- **Complete** — re-emits the entire result table; used for aggregations that may update.
+- **Update** — only changed rows (a third option not used here).
+
+## 13. Approximate distinct counts
+
+**What it is:** `F.approx_count_distinct("user_id")` uses the **HyperLogLog** algorithm for fast, memory-efficient cardinality estimates.
+
+**In this project:** `unique_users` in the Gold layer.
+
+**Interview talking points:**
+- Exact `countDistinct` is expensive at scale (full shuffle); HLL trades a small error (~2%) for big performance gains — ideal for streaming KPIs.
+
+## 14. Widgets (notebook parameterization)
+
+**What it is:** `dbutils.widgets` create notebook parameters that can be set in the UI or **passed by a Job**.
+
+**In this project:** Every notebook exposes `catalog`, `schema`, `volume_path` widgets, so the same code runs across environments without edits.
+
+**Interview talking points:**
+- Enables **environment promotion** (dev/staging/prod) by changing parameters, not code.
+- Jobs override widget values per task run.
+
+## 15. Secrets & Secret Scopes
+
+**What it is:** A secure, encrypted key–value store in the workspace. Read at runtime with `dbutils.secrets.get(scope, key)`; values are **redacted** in output.
+
+**In this project (`05_anomalies_detection`):**
+```python
+OPENAI_API_KEY = dbutils.secrets.get(scope="anomaly_proj_secrets", key="openai_api_key")
+DISCORD_URL    = dbutils.secrets.get(scope="anomaly_proj_secrets", key="discord_webhook_url")
+```
+
+**Interview talking points:**
+- Keeps credentials **out of code and out of git**.
+- Databricks-backed vs Azure Key Vault-backed scopes; access controlled via ACLs.
+
+## 16. Databricks Jobs / Workflows (orchestration)
+
+**What it is:** Native orchestration for multi-task pipelines with dependencies, retries, scheduling, and parameters.
+
+**In this project (`workflow/databricks_pipeline.py`):** defines a DAG `Raw_Data_Generation → Bronze_Ingestion → Silver_Cleaning → Gold_KPIs → Detect_Anomalies` using `depends_on`.
+
+**Interview talking points:**
+- **Task dependencies** build a DAG; tasks can be notebooks, Python, SQL, dbt, etc.
+- **Serverless jobs** + `availableNow` triggers = cost-efficient scheduled micro-batch pipeline.
+- Features to mention: retries, `queue.enabled`, `performance_target`, task values, conditional/`if-else` tasks.
+
+## 17. Databricks SDK (infrastructure-as-code for jobs)
+
+**What it is:** `databricks-sdk` (`WorkspaceClient`) lets you manage workspace objects programmatically.
+
+**In this project:** the Job is defined in Python and pushed with `w.jobs.reset(...)` (update) or `w.jobs.create(...)` (new).
+
+**Interview talking points:**
+- Defining jobs **as code** enables version control and CI/CD (vs. clicking in the UI).
+- `reset` (full update to a known `job_id`) vs `create` (new job).
+
+## 18. `dbutils` utilities
+
+**What it is:** The Databricks utility namespace used throughout: `dbutils.widgets`, `dbutils.secrets`, `dbutils.library.restartPython()`, and **`dbutils.notebook.exit(...)`** for early, clean termination.
+
+**In this project (`05`):** exits early with `dbutils.notebook.exit("No anomaly detected")` when there's nothing to alert — a clean way to short-circuit a Job task.
+
+## 19. Managed tables & `toTable` / `saveAsTable`
+
+**What it is:** Writing directly to a Unity Catalog table name (rather than a path). Databricks manages storage/metadata.
+
+**In this project:** streaming writes use `.toTable(BRONZE_TABLE)`; the alert writer uses `.write.mode("append").saveAsTable(ALERT_TABLE)`.
+
+**Interview talking points:**
+- **Managed** (Databricks owns lifecycle/storage) vs **external** tables (you own the path).
+
+## 20. Serverless compute
+
+**What it is:** Databricks-managed compute with no cluster to size or keep running.
+
+**In this project:** all notebooks/Jobs run on serverless (Free Edition default), pairing naturally with `availableNow` for scale-to-zero cost.
+
+## 21. Incident-dedup with a left-anti join (applied SQL/Spark)
+
+**What it is:** `gold.join(alert_history, on=[...], how="left_anti")` returns only Gold windows **not already** in the alert history — a clean set-difference pattern.
+
+**In this project (`05`):** ensures each 5-minute window is evaluated/alerted **exactly once**, even across repeated runs.
+
+**Interview talking points:**
+- Join types worth knowing: inner, left/right outer, **left-anti**, left-semi.
+- This is an **idempotency / exactly-once alerting** pattern — a strong point to raise for production monitoring.
+
+## 22. AI integration pattern (LLM as an analyst)
+
+**What it is:** Using an LLM to turn structured anomalies + context into a human-readable incident summary.
+
+**In this project (`05`):** deterministic rules detect anomalies; the LLM only **explains** them using retrieved funnel/category/page context, then posts to Discord.
+
+**Interview talking points:**
+- **Rules for detection, LLM for explanation** — deterministic where it matters, generative where it adds value. This avoids trusting an LLM to "decide" incidents.
+- Context enrichment ≈ a lightweight **RAG** pattern (retrieve supporting metrics, then prompt).
+- On Databricks you could swap OpenAI for **Foundation Model APIs / Model Serving / AI Functions (`ai_query`)** to keep everything in-platform.
+
+---
+
+## Rapid-fire interview Q&A (from this project)
+
+- **Why Bronze/Silver/Gold?** Reprocessing safety, separation of concerns, and layer-specific consumers.
+- **Why Auto Loader over plain file reads?** Incremental, checkpointed file tracking + schema inference/evolution at scale.
+- **What does the watermark do?** Bounds state for dedup/aggregation and controls how long late data is accepted.
+- **`availableNow` vs `processingTime`?** Catch-up-then-stop (scheduled/cost-efficient) vs always-on (low latency).
+- **How do you guarantee exactly-once?** Checkpoints + idempotent Delta sinks; plus a left-anti join for exactly-once alerting.
+- **Append vs complete output mode?** New rows vs full re-emit of an aggregate result.
+- **Why `approx_count_distinct`?** HyperLogLog — fast, low-memory cardinality for streaming KPIs.
+- **How are secrets handled?** Secret scopes via `dbutils.secrets.get`, never hard-coded.
+- **How is the pipeline orchestrated?** A Databricks Job DAG defined as code with the SDK; serverless tasks with `availableNow`.
+- **Where does the LLM fit?** Explanation/summarization only; detection stays deterministic and testable.
+
+---
+
 # Future Enhancements
 
 * Dynamic / statistical thresholds and ML-based forecasting
